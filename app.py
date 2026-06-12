@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Servidor web - Modelo Poisson con ranking FIFA, momentum y actualizacion automatica"""
 
-import json, math, urllib.request, os, threading, time
+import json, math, urllib.request, os, threading, time, re
 from collections import defaultdict, deque
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -79,6 +79,59 @@ def fetch_json(url):
     except Exception as e:
         log(f"Error fetching {url}: {e}")
         return None
+
+def fetch_txt(url):
+    try:
+        resp = urllib.request.urlopen(url, timeout=10)
+        return resp.read().decode("utf-8")
+    except:
+        return None
+
+TXT_API = "https://raw.githubusercontent.com/openfootball/worldcup/master/2026--usa/cup.txt"
+
+def parse_cup_txt():
+    """Fetch and parse cup.txt for live scores not yet in JSON."""
+    data = fetch_txt(TXT_API)
+    if not data:
+        return {}, {}
+    wc = set().union(*conf_map.values())
+    # Build name map from TXT convention to model names
+    txt_names = {"Korea Republic": "South Korea", "IR Iran": "Iran",
+                 "Cabo Verde": "Cape Verde", "Congo DR": "DR Congo",
+                 "Côte d'Ivoire": "Ivory Coast", "Czechia": "Czech Republic",
+                 "Türkiye": "Turkey"}
+    def fn(name):
+        return txt_names.get(name, name)
+    scores = {}   # (team1, team2) -> (g1, g2)
+    fixtures = {} # (team1, team2) -> True
+    for line in data.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith(("#","=","▪","Group")):
+            continue
+        # Match line examples:
+        # "  15:00 UTC-4     Canada   1-1 (0-1) Bosnia & Herzegovina    @ Toronto"
+        # "  12:00 UTC-7     Switzerland  v Bosnia & Herzegovina   @ Los Angeles"
+        parts = re.split(r"\s{3,}", line)
+        if len(parts) < 3:
+            continue
+        if " v " in parts[1]:
+            # Unplayed: "Switzerland  v Bosnia & Herzegovina"
+            t1 = fn(parts[1].split(" v ")[0].strip())
+            t2 = fn(parts[1].split(" v ")[1].strip())
+            if t1 in wc and t2 in wc:
+                fixtures[(t1, t2)] = True
+        else:
+            # Played: parts[1]="Canada", parts[2]="1-1 (0-1) Bosnia & Herzegovina"
+            t1 = fn(parts[1].strip())
+            sm = re.match(r"(\d+)-(\d+)", parts[2].strip())
+            if sm:
+                rest = parts[2][sm.end():].strip()
+                # Remove halftime score "(0-1)"
+                rest = re.sub(r"\(.*?\)", "", rest).strip()
+                t2 = fn(rest) if rest else ""
+                if t1 in wc and t2 in wc:
+                    scores[(t1, t2)] = (int(sm.group(1)), int(sm.group(2)))
+    return scores, fixtures
 
 state = {
     "strengths": {}, "league_avg": 2.59, "matches": [], "log": [],
@@ -325,6 +378,14 @@ def fetch_and_update():
         matches_all.append(m)
 
     state["matches"] = sorted(matches_all, key=lambda x: (x["date"], x.get("time", "")))
+
+    # TXT scores como respaldo (openfootball/worldcup se actualiza antes que worldcup.json)
+    txt_scores, _ = parse_cup_txt()
+    for m in state["matches"]:
+        if "score" not in m:
+            key = (m["team1"], m["team2"])
+            if key in txt_scores:
+                m["score"] = {"ft": list(txt_scores[key])}
 
     known_keys = {x["key"] for x in state["log"]}
     new_results = []

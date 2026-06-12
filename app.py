@@ -11,6 +11,7 @@ API_2026 = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/
 WC_YEARS = [2014, 2018, 2022]
 HIST_API = "https://raw.githubusercontent.com/openfootball/worldcup.json/master"
 POLL_INTERVAL = 120
+LOG_FILE = os.path.join(DATA_DIR, "log.json")
 
 NAME_MAP = {
     "Canada": "Canadá", "Mexico": "México", "USA": "Estados Unidos",
@@ -49,19 +50,42 @@ RANKING_FACTOR = {
     "Jordan":0.8693,"Haiti":0.8346,"Curaçao":0.8208,"New Zealand":0.8,
 }
 
+KO_FACTOR = {
+    "Round of 32": 0.85, "Round of 16": 0.85,
+    "Quarter-finals": 0.80, "Semi-finals": 0.75,
+    "Final": 0.72, "Match for third place": 0.85,
+}
+
+def fmt_ph(name):
+    if name.startswith("W"):
+        return f"Ganador {name[1:]}"
+    if name.startswith("L"):
+        return f"Perdedor {name[1:]}"
+    if name.startswith(("1","2")):
+        return f"{'1°' if name[0]=='1' else '2°'} {name[1:]}"
+    if name.startswith("3"):
+        return name
+    return name
+
 def es(t): return NAME_MAP.get(t, t)
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def fetch_json(url):
     try:
         resp = urllib.request.urlopen(url, timeout=10)
         return json.loads(resp.read())
-    except:
+    except Exception as e:
+        log(f"Error fetching {url}: {e}")
         return None
 
 state = {
     "strengths": {}, "league_avg": 2.59, "matches": [], "log": [],
     "last_update": None, "correct_result": 0, "correct_exact": 0, "total_played": 0,
 }
+_bracket_cache = []
+_bracket_dirty = True
 
 def init_model():
     all_m = []
@@ -142,15 +166,23 @@ def combined(team):
     dfn = w_hist * s["defense_hist"] + (1-w_hist) * s["defense_form"]
     return atk, dfn
 
-def predict(t1, t2, ko=False):
+def predict(t1, t2, ronda=""):
     s = state["strengths"]
     la = state["league_avg"]
     a1, d1 = combined(t1)
     a2, d2 = combined(t2)
     e1 = la * a1 * d2
     e2 = la * a2 * d1
-    if ko:
-        e1 *= 0.82; e2 *= 0.82
+    if ronda:
+        f = 1.0
+        for key, val in KO_FACTOR.items():
+            if key in ronda:
+                f = val
+                break
+        else:
+            if "Matchday" not in ronda:
+                f = 0.82
+        e1 *= f; e2 *= f
     return e1, e2
 
 def poisson(l, k):
@@ -186,7 +218,6 @@ def update(t1, t2, g1, g2):
         update_form(team, obs_a, obs_d)
 
 def resolve_bracket(raw_matches):
-    """Reemplaza placeholders (1A, 2B, 3A/B/C/D/F) con nombres reales basados en tabla de grupos."""
     groups = defaultdict(dict)
     for m in raw_matches:
         if "Matchday" not in m.get("round", ""):
@@ -214,7 +245,6 @@ def resolve_bracket(raw_matches):
             if played:
                 pos_map[f"{rk}{grp.replace('Group ','')}"] = tm
 
-    # Terceros puestos: ranking general, top 8 clasifican
     third = []
     for grp, teams in groups.items():
         played = any(v["gp"] > 0 for v in teams.values())
@@ -224,9 +254,8 @@ def resolve_bracket(raw_matches):
         tm, st = ranked[2]
         third.append((tm, st["pts"], st["gd"], st["gf"], grp.replace("Group ", "")))
     third.sort(key=lambda x: (-x[1], -x[2], -x[3]))
-    qual = {t[4] for t in third[:8]}  # grupos cuyos 3ros clasificaron
+    qual = {t[4] for t in third[:8]}
 
-    # Slots de 3ros puestos (de la estructura fija del bracket)
     third_slots = [
         (["A","B","C","D","F"], 2), (["C","D","F","G","H"], 5),
         (["C","E","F","H","I"], 7), (["E","H","I","J","K"], 8),
@@ -242,11 +271,8 @@ def resolve_bracket(raw_matches):
                 break
 
     def ph(name):
-        if name.startswith("W") or name.startswith("L"):
-            return name
         if name in pos_map:
             return pos_map[name]
-        # 3A/B/C/D/F -> buscar el mejor 3ro entre esos grupos
         parts = name.split("/")
         for tm, _, _, _, grp in third[:8]:
             if grp in parts and grp in qual:
@@ -256,44 +282,55 @@ def resolve_bracket(raw_matches):
     resolved = []
     for m in raw_matches:
         t1, t2 = m["team1"], m["team2"]
-        if t1.startswith("W") or t2.startswith("W"):
-            continue
         r = dict(m)
         r["team1"] = ph(t1)
         r["team2"] = ph(t2)
         resolved.append(r)
-    return resolved
+    return resolved, pos_map
+
+def save_log():
+    try:
+        with open(LOG_FILE, "w") as f:
+            json.dump(state["log"], f)
+    except:
+        pass
+
+def load_log():
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE) as f:
+                state["log"] = json.load(f)
+        except:
+            pass
 
 def fetch_and_update():
+    global _bracket_cache, _bracket_dirty
     data = fetch_json(API_2026)
     if not data:
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    matches_2026 = {}
+    matches_all = []
     for m in data["matches"]:
-        t1, t2 = m["team1"], m["team2"]
-        if t1.startswith("W") or t2.startswith("W"):
-            continue
-        matches_2026[(m["date"], t1, t2)] = m
+        matches_all.append(m)
 
-    state["matches"] = sorted(matches_2026.values(), key=lambda x: (x["date"], x.get("time", "")))
+    state["matches"] = sorted(matches_all, key=lambda x: (x["date"], x.get("time", "")))
 
+    known_keys = {x["key"] for x in state["log"]}
     new_results = []
     for m in state["matches"]:
         if "score" not in m:
             continue
         t1, t2, g1, g2 = m["team1"], m["team2"], m["score"]["ft"][0], m["score"]["ft"][1]
         lk = f"{m['date']}|{t1}|{t2}"
-        if lk not in {x["key"] for x in state["log"]}:
+        if lk not in known_keys:
             new_results.append(m)
             state["log"].append({"key": lk, "date": m["date"], "team1": t1, "team2": t2, "g1": g1, "g2": g2})
 
     for m in new_results:
         t1, t2, g1, g2 = m["team1"], m["team2"], m["score"]["ft"][0], m["score"]["ft"][1]
         rnd = m.get("round", m.get("group", ""))
-        ko = rnd and "Matchday" not in rnd
-        e1, e2 = predict(t1, t2, ko)
+        e1, e2 = predict(t1, t2, rnd)
         p = probs(e1, e2)
         pw = 0 if p["ml"][0] > p["ml"][1] else (2 if p["ml"][0] < p["ml"][1] else 1)
         rw = 0 if g1 > g2 else (2 if g1 < g2 else 1)
@@ -310,14 +347,31 @@ def fetch_and_update():
                 entry.update({"pred": list(p["ml"]), "result_ok": r_ok, "exact_ok": e_ok})
                 break
 
+    if new_results:
+        _bracket_dirty = True
+        log(f"Procesados {len(new_results)} nuevos resultados")
+
     state["last_update"] = now
+    save_log()
+
+    # Recalcular aciertos desde el log completo (por si hubo reinicio)
+    state["correct_result"] = sum(1 for x in state["log"] if x.get("result_ok"))
+    state["correct_exact"] = sum(1 for x in state["log"] if x.get("exact_ok"))
+    state["total_played"] = len([x for x in state["log"] if x.get("result_ok") is not None])
+
+def get_cached_bracket():
+    global _bracket_cache, _bracket_dirty
+    if _bracket_dirty or not _bracket_cache:
+        _bracket_cache, pm = resolve_bracket(state["matches"])
+        _bracket_dirty = False
+    return _bracket_cache
 
 def bg_loop():
     while True:
         try:
             fetch_and_update()
-        except:
-            pass
+        except Exception as e:
+            log(f"Error en bg: {e}")
         time.sleep(POLL_INTERVAL)
 
 HTML = """<!DOCTYPE html>
@@ -366,6 +420,7 @@ h1{color:#fff;font-size:1.5em;margin-bottom:5px}
 .tag{display:inline-block;font-size:0.65em;padding:1px 6px;border-radius:4px;margin-left:4px}
 .tag-ko{background:#4a2a6a;color:#c4a0e8}
 .tag-group{background:#1a3a2a;color:#86efac}
+.tbd{color:#666;font-style:italic}
 </style>
 </head>
 <body>
@@ -399,13 +454,17 @@ let tag=c.round?.startsWith('Matchday')
   ?'<span class="tag tag-group">'+c.group+'</span>'
   :'<span class="tag tag-ko">'+c.round+'</span>';
 let mom=c.momentum?'<span class="momentum">⚡</span>':'';
+let t1c=c.t1.startsWith('Ganador')||c.t1.startsWith('Perdedor')||c.t1.match(/^[0-9]/)?'tbd':'';
+let t2c=c.t2.startsWith('Ganador')||c.t2.startsWith('Perdedor')||c.t2.match(/^[0-9]/)?'tbd':'';
+let n1=t1c?'<span class=tbd>'+c.t1+'</span>':c.t1;
+let n2=t2c?'<span class=tbd>'+c.t2+'</span>':c.t2;
 html+=`
 <div class="card ${cls}">
 <div class="meta">${c.date} ${tag}</div>
 <div class=matchup>
-<div class="team left">${c.t1}</div>
+<div class="team left">${n1}</div>
 ${c.played?`<div class=score>${c.real[0]}-${c.real[1]}</div>`:'<div class=vs>vs</div>'}
-<div class="team right">${c.t2}${mom}</div>
+<div class="team right">${n2}${mom}</div>
 </div>
 <div class=pct-row>
 <span class="pct-win">${c.w1}%</span>
@@ -434,20 +493,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             cards = []
-            resolved = resolve_bracket(state["matches"])
+            resolved = get_cached_bracket()
             for m in resolved:
                 t1, t2 = m["team1"], m["team2"]
                 rnd = m.get("round", m.get("group", ""))
-                ko = rnd and "Matchday" not in rnd
                 known = t1 in state["strengths"] and t2 in state["strengths"]
                 if known:
-                    e1, e2 = predict(t1, t2, ko)
+                    e1, e2 = predict(t1, t2, rnd)
                     p = probs(e1, e2)
                 else:
                     p = {"w1":0,"dr":0,"w2":0,"ml":[0,0],"pml":0}
                 card = {
                     "date": m["date"], "group": m.get("group", ""), "round": rnd,
-                    "t1": es(t1), "t2": es(t2),
+                    "t1": fmt_ph(t1) if t1 not in state["strengths"] else es(t1),
+                    "t2": fmt_ph(t2) if t2 not in state["strengths"] else es(t2),
                     "w1": p["w1"], "dr": p["dr"], "w2": p["w2"],
                     "ml": list(p["ml"]), "pml": p["pml"],
                     "played": "score" in m,
@@ -461,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                             break
                 s = state["strengths"].get(t1, {})
                 nf = len(s.get("form_obs", []))
-                card["momentum"] = nf >= 1
+                card["momentum"] = nf >= 2
                 cards.append(card)
             pending = sum(1 for c in cards if not c["played"])
             self.wfile.write(json.dumps({
@@ -482,15 +541,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def run(port=8080):
     server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"Servidor: http://0.0.0.0:{port}")
+    log(f"Servidor iniciado en puerto {port}")
     server.serve_forever()
 
 if __name__ == "__main__":
     import sys
-    print("Inicializando modelo mejorado...")
+    log("Inicializando modelo...")
     s, la, _ = init_model()
     state["strengths"] = s
     state["league_avg"] = la
+    load_log()
     fetch_and_update()
     t = threading.Thread(target=bg_loop, daemon=True)
     t.start()

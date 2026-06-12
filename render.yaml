@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: mundial-2026-predictor
+    runtime: python
+    buildCommand: ""
+    startCommand: python app.py 8080
+    healthCheckPath: /

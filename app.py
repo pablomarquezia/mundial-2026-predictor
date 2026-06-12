@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DATA_DIR = os.path.dirname(__file__)
 API_2026 = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
-WC_YEARS = [2014, 2018, 2022]
+WC_YEARS = [(2014, 0.5), (2018, 0.75), (2022, 1.0)]
 HIST_API = "https://raw.githubusercontent.com/openfootball/worldcup.json/master"
 POLL_INTERVAL = 120
 LOG_FILE = os.path.join(DATA_DIR, "log.json")
@@ -89,7 +89,7 @@ _bracket_dirty = True
 
 def init_model():
     all_m = []
-    for year in WC_YEARS:
+    for year, weight in WC_YEARS:
         data = fetch_json(f"{HIST_API}/{year}/worldcup.json")
         if not data:
             continue
@@ -98,14 +98,17 @@ def init_model():
                 continue
             t1 = HIST_MAP.get(m["team1"], m["team1"])
             t2 = HIST_MAP.get(m["team2"], m["team2"])
-            all_m.append({"team1": t1, "team2": t2, "g1": m["score"]["ft"][0], "g2": m["score"]["ft"][1]})
+            all_m.append({"team1": t1, "team2": t2, "g1": m["score"]["ft"][0], "g2": m["score"]["ft"][1], "w": weight})
 
     stats = defaultdict(lambda: {"gf": 0, "ga": 0, "pj": 0})
     for m in all_m:
+        w = m["w"]
         for t, gf, ga in [(m["team1"], m["g1"], m["g2"]), (m["team2"], m["g2"], m["g1"])]:
-            stats[t]["gf"] += gf; stats[t]["ga"] += ga; stats[t]["pj"] += 1
+            stats[t]["gf"] += gf * w
+            stats[t]["ga"] += ga * w
+            stats[t]["pj"] += w
 
-    league_avg = sum(m["g1"]+m["g2"] for m in all_m) / len(all_m) / 2 if all_m else 1
+    league_avg = sum((m["g1"]+m["g2"]) * m["w"] for m in all_m) / sum(m["w"] for m in all_m) / 2 if all_m else 1
     all_teams = [t for c in conf_map.values() for t in c]
 
     strengths = {}
@@ -136,8 +139,11 @@ def init_model():
             s["defense_hist"] = s["defense"]
             s["estimated"] = False
         else:
-            atk = ca["attack"] * rf
-            defn = ca["defense"] / rf
+            rf_adj = rf ** 1.5
+            # Prior Bayesiano: debutantes regresan a la media global
+            conf_w = 0.6
+            atk = (ca["attack"] * conf_w + 1.0 * (1 - conf_w)) * rf_adj
+            defn = (ca["defense"] * conf_w + 1.0 * (1 - conf_w)) / rf_adj
             strengths[team] = {
                 "attack": atk, "defense": defn,
                 "attack_hist": atk, "defense_hist": defn,

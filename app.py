@@ -439,10 +439,14 @@ class Handler(BaseHTTPRequestHandler):
                 t1, t2 = m["team1"], m["team2"]
                 rnd = m.get("round", m.get("group", ""))
                 ko = rnd and "Matchday" not in rnd
-                e1, e2 = predict(t1, t2, ko)
-                p = probs(e1, e2)
+                known = t1 in state["strengths"] and t2 in state["strengths"]
+                if known:
+                    e1, e2 = predict(t1, t2, ko)
+                    p = probs(e1, e2)
+                else:
+                    p = {"w1":0,"dr":0,"w2":0,"ml":[0,0],"pml":0}
                 card = {
-                    "date": m["date"], "group": m["group"], "round": rnd,
+                    "date": m["date"], "group": m.get("group", ""), "round": rnd,
                     "t1": es(t1), "t2": es(t2),
                     "w1": p["w1"], "dr": p["dr"], "w2": p["w2"],
                     "ml": list(p["ml"]), "pml": p["pml"],

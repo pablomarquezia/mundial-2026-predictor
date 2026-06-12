@@ -479,12 +479,12 @@ ${c.played?`<div class=score>${c.real[0]}-${c.real[1]}</div>`:'<div class=vs>vs<
 <div class="team right">${n2}${mom}</div>
 </div>
 <div class=pct-row>
-<span class="pct-win">${c.w1}%</span>
-<span class="pct-draw">${c.dr}%</span>
-<span class="pct-loss">${c.w2}%</span>
+<span class="pct-win" title="Victoria ${c.t1}">${c.w1}%</span>
+<span class="pct-draw" title="Empate">${c.dr}%</span>
+<span class="pct-loss" title="Victoria ${c.t2}">${c.w2}%</span>
 </div>
 <div class=bar-cont><div class=bar-win style=width:${c.w1}%></div><div class=bar-draw style=width:${c.dr}%></div><div class=bar-loss style=width:${c.w2}%></div></div>
-<div class=pred>Pred: <span class=ml>${c.ml[0]}-${c.ml[1]}</span> (${c.pml}%)${sc}</div>
+<div class=pred>Pred: <span class=ml title="Marcador más probable">${c.ml[0]}-${c.ml[1]}</span> (<span title="Probabilidad del marcador exacto">${c.pml}%</span>)${sc}</div>
 </div>`;
 });
 document.getElementById('cards').innerHTML=html;

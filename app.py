@@ -468,8 +468,10 @@ let t1c=c.t1.startsWith('Ganador')||c.t1.startsWith('Perdedor')||c.t1.match(/^[0
 let t2c=c.t2.startsWith('Ganador')||c.t2.startsWith('Perdedor')||c.t2.match(/^[0-9]/)?'tbd':'';
 let n1=t1c?'<span class=tbd>'+c.t1+'</span>':c.t1;
 let n2=t2c?'<span class=tbd>'+c.t2+'</span>':c.t2;
-html+=`
-<div class="card ${cls}">
+    let tt=c.played?`Pred: ${c.ml[0]}-${c.ml[1]} (${c.pml}%) | Real: ${c.real[0]}-${c.real[1]}${c.exact_ok?' ✓':c.result_ok?' ~':' ✗'}`
+      :`Pred: ${c.ml[0]}-${c.ml[1]} (${c.pml}%) | ${c.w1}%/${c.dr}%/${c.w2}%`;
+    html+=`
+ <div class="card ${cls}" title="${tt}">
 <div class="meta">${c.date} ${tag}</div>
 <div class=matchup>
 <div class="team left">${n1}</div>

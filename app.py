@@ -197,9 +197,13 @@ def probs(e1, e2, mg=6):
     w1 = sum(p for (g1,g2),p in exact.items() if g1>g2)
     dr = sum(p for (g1,g2),p in exact.items() if g1==g2)
     w2 = sum(p for (g1,g2),p in exact.items() if g1<g2)
-    ml = max(exact, key=exact.get)
+    # Score que maximiza puntos esperados: E = 3 * (P(score) + P(resultado))
+    def ev(s):
+        p_out = w1 if s[0] > s[1] else (dr if s[0] == s[1] else w2)
+        return exact[s] + p_out
+    best = max(exact, key=ev)
     return {"w1": round(w1*100,1), "dr": round(dr*100,1), "w2": round(w2*100,1),
-            "ml": list(ml), "pml": round(exact[ml]*100,1)}
+            "ml": list(best), "pml": round(exact[best]*100,1)}
 
 def update(t1, t2, g1, g2):
     s = state["strengths"]

@@ -185,6 +185,85 @@ def update(t1, t2, g1, g2):
         st["pj_hist"] += 1
         update_form(team, obs_a, obs_d)
 
+def resolve_bracket(raw_matches):
+    """Reemplaza placeholders (1A, 2B, 3A/B/C/D/F) con nombres reales basados en tabla de grupos."""
+    groups = defaultdict(dict)
+    for m in raw_matches:
+        if "Matchday" not in m.get("round", ""):
+            continue
+        g = m["group"]
+        for t in [m["team1"], m["team2"]]:
+            if t not in groups[g]:
+                groups[g][t] = {"pts": 0, "gd": 0, "gf": 0, "gp": 0}
+        if "score" not in m:
+            continue
+        t1, t2 = m["team1"], m["team2"]
+        g1, g2 = m["score"]["ft"]
+        for team, gf, ga in [(t1, g1, g2), (t2, g2, g1)]:
+            p = groups[g][team]
+            p["gp"] += 1
+            p["pts"] += 3 if gf > ga else (1 if gf == ga else 0)
+            p["gd"] += gf - ga
+            p["gf"] += gf
+
+    pos_map = {}
+    for grp, teams in groups.items():
+        played = any(v["gp"] > 0 for v in teams.values())
+        ranked = sorted(teams.items(), key=lambda x: (-x[1]["pts"], -x[1]["gd"], -x[1]["gf"]))
+        for rk, (tm, _) in enumerate(ranked, 1):
+            if played:
+                pos_map[f"{rk}{grp.replace('Group ','')}"] = tm
+
+    # Terceros puestos: ranking general, top 8 clasifican
+    third = []
+    for grp, teams in groups.items():
+        played = any(v["gp"] > 0 for v in teams.values())
+        if not played:
+            continue
+        ranked = sorted(teams.items(), key=lambda x: (-x[1]["pts"], -x[1]["gd"], -x[1]["gf"]))
+        tm, st = ranked[2]
+        third.append((tm, st["pts"], st["gd"], st["gf"], grp.replace("Group ", "")))
+    third.sort(key=lambda x: (-x[1], -x[2], -x[3]))
+    qual = {t[4] for t in third[:8]}  # grupos cuyos 3ros clasificaron
+
+    # Slots de 3ros puestos (de la estructura fija del bracket)
+    third_slots = [
+        (["A","B","C","D","F"], 2), (["C","D","F","G","H"], 5),
+        (["C","E","F","H","I"], 7), (["E","H","I","J","K"], 8),
+        (["B","E","F","I","J"], 9), (["A","E","H","I","J"], 10),
+        (["E","F","G","I","J"], 13),(["D","E","I","J","L"], 15),
+    ]
+    used = set()
+    for slot_groups, _ in sorted(third_slots, key=lambda x: len([g for g in x[0] if g in qual])):
+        for tm, _, _, _, grp in third[:8]:
+            if grp in slot_groups and grp not in used:
+                pos_map[f"3_{_}"] = tm
+                used.add(grp)
+                break
+
+    def ph(name):
+        if name.startswith("W") or name.startswith("L"):
+            return name
+        if name in pos_map:
+            return pos_map[name]
+        # 3A/B/C/D/F -> buscar el mejor 3ro entre esos grupos
+        parts = name.split("/")
+        for tm, _, _, _, grp in third[:8]:
+            if grp in parts and grp in qual:
+                return tm
+        return name
+
+    resolved = []
+    for m in raw_matches:
+        t1, t2 = m["team1"], m["team2"]
+        if t1.startswith("W") or t2.startswith("W"):
+            continue
+        r = dict(m)
+        r["team1"] = ph(t1)
+        r["team2"] = ph(t2)
+        resolved.append(r)
+    return resolved
+
 def fetch_and_update():
     data = fetch_json(API_2026)
     if not data:
@@ -355,13 +434,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             cards = []
-            for m in state["matches"]:
+            resolved = resolve_bracket(state["matches"])
+            for m in resolved:
                 t1, t2 = m["team1"], m["team2"]
-        rnd = m.get("round", m.get("group", ""))
-        ko = rnd and "Matchday" not in rnd
+                rnd = m.get("round", m.get("group", ""))
+                ko = rnd and "Matchday" not in rnd
                 e1, e2 = predict(t1, t2, ko)
                 p = probs(e1, e2)
-                rnd = m.get("round", m.get("group", ""))
                 card = {
                     "date": m["date"], "group": m["group"], "round": rnd,
                     "t1": es(t1), "t2": es(t2),

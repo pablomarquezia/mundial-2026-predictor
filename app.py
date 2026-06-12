@@ -193,9 +193,10 @@ def fetch_and_update():
 
     matches_2026 = {}
     for m in data["matches"]:
-        if not m.get("group"):
+        t1, t2 = m["team1"], m["team2"]
+        if t1.startswith("W") or t2.startswith("W"):
             continue
-        matches_2026[(m["date"], m["team1"], m["team2"])] = m
+        matches_2026[(m["date"], t1, t2)] = m
 
     state["matches"] = sorted(matches_2026.values(), key=lambda x: (x["date"], x.get("time", "")))
 
@@ -211,7 +212,8 @@ def fetch_and_update():
 
     for m in new_results:
         t1, t2, g1, g2 = m["team1"], m["team2"], m["score"]["ft"][0], m["score"]["ft"][1]
-        ko = not m["group"].startswith("Group")
+        rnd = m.get("round", m.get("group", ""))
+        ko = rnd and "Matchday" not in rnd
         e1, e2 = predict(t1, t2, ko)
         p = probs(e1, e2)
         pw = 0 if p["ml"][0] > p["ml"][1] else (2 if p["ml"][0] < p["ml"][1] else 1)
@@ -307,15 +309,16 @@ document.getElementById('stats').innerHTML=
 let html='';
 cards.forEach(c=>{
 let cls=c.played?'played':'pending';
-if(!c.group?.startsWith('Group')) cls+=' ko';
+if(!c.round?.startsWith('Matchday')) cls+=' ko';
 let sc='';
 if(c.played){
 let ok=c.result_ok?'ok':'err';
 let em=c.exact_ok?'✓':' ';
 sc='<span class="status '+ok+'">'+em+' '+c.real[0]+'-'+c.real[1]+'</span>';
 }
-let tag='<span class="tag tag-group">Grupo</span>';
-if(!c.group?.startsWith('Group')) tag='<span class="tag tag-ko">Elim.</span>';
+let tag=c.round?.startsWith('Matchday')
+  ?'<span class="tag tag-group">'+c.group+'</span>'
+  :'<span class="tag tag-ko">'+c.round+'</span>';
 let mom=c.momentum?'<span class="momentum">⚡</span>':'';
 html+=`
 <div class="card ${cls}">
@@ -354,11 +357,13 @@ class Handler(BaseHTTPRequestHandler):
             cards = []
             for m in state["matches"]:
                 t1, t2 = m["team1"], m["team2"]
-                ko = not m["group"].startswith("Group")
+        rnd = m.get("round", m.get("group", ""))
+        ko = rnd and "Matchday" not in rnd
                 e1, e2 = predict(t1, t2, ko)
                 p = probs(e1, e2)
+                rnd = m.get("round", m.get("group", ""))
                 card = {
-                    "date": m["date"], "group": m["group"],
+                    "date": m["date"], "group": m["group"], "round": rnd,
                     "t1": es(t1), "t2": es(t2),
                     "w1": p["w1"], "dr": p["dr"], "w2": p["w2"],
                     "ml": list(p["ml"]), "pml": p["pml"],

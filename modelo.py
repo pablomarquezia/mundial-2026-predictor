@@ -3,9 +3,10 @@
 
 import json, math, urllib.request, os, random
 from collections import defaultdict, deque
+from datetime import date
 
 DATA_DIR = os.path.dirname(__file__)
-WC_YEARS = [2014, 2018, 2022]
+WC_YEARS = [(2014, 0.5), (2018, 0.75), (2022, 1.0)]
 API_BASE = "https://raw.githubusercontent.com/openfootball/worldcup.json/master"
 API_2026 = API_BASE + "/2026/worldcup.json"
 
@@ -46,6 +47,25 @@ RANKING_FACTOR = {
     "Jordan":0.8693,"Haiti":0.8346,"Curaçao":0.8208,"New Zealand":0.8,
 }
 
+KO_FACTOR = {
+    "Round of 32": 0.85, "Round of 16": 0.85,
+    "Quarter-finals": 0.80, "Semi-finals": 0.75,
+    "Final": 0.72, "Match for third place": 0.85,
+}
+
+# Odds de mercado (The Odds API)
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer_fifa_world_cup/odds"
+ODDS_WEIGHT = 0.35
+_odds_cache = {}
+
+# Normalización de nombres entre openfootball y odds API
+ODDS_NAME_MAP = {
+    "bosnia & herzegovina": "bosnia and herzegovina",
+    "curaçao": "curacao",
+    "dr congo": "congo dr",
+}
+
 def es(name):
     return NAME_MAP.get(name, name)
 
@@ -56,9 +76,46 @@ def fetch_json(url):
     except:
         return None
 
+def norm_team(name):
+    n = name.lower().replace("'", "").replace("é", "e").replace("ç", "c").replace("&", "and").strip()
+    return ODDS_NAME_MAP.get(n, n)
+
+def fetch_market_odds():
+    if not ODDS_API_KEY:
+        return {}
+    today_s = date.today().isoformat()
+    if today_s in _odds_cache:
+        return _odds_cache[today_s]
+    print("  📊 Consultando odds de mercado...")
+    url = f"{ODDS_API_URL}?regions=eu,us&markets=h2h&oddsFormat=decimal&apiKey={ODDS_API_KEY}"
+    try:
+        resp = urllib.request.urlopen(url, timeout=10)
+        data = json.loads(resp.read())
+    except Exception as e:
+        print(f"  ⚠ Error al obtener odds: {e}")
+        return {}
+    result = {}
+    for match in data:
+        ht, at = match["home_team"], match["away_team"]
+        key = (norm_team(ht), norm_team(at))
+        for bk in match.get("bookmakers", []):
+            for market in bk.get("markets", []):
+                if market["key"] != "h2h":
+                    continue
+                odds = {o["name"]: o["price"] for o in market["outcomes"]}
+                if ht in odds and "Draw" in odds and at in odds:
+                    imp = (1/odds[ht], 1/odds["Draw"], 1/odds[at])
+                    if bk["key"] == "pinnacle" or key not in result:
+                        result[key] = imp
+                    break
+    if result:
+        print(f"  ✓ Odds obtenidos para {len(result)} partidos")
+    _odds_cache[today_s] = result
+    return result
+
 def load_historical_matches():
     all_m = []
-    for year in WC_YEARS:
+    for year, weight in WC_YEARS:
         data = fetch_json(f"{API_BASE}/{year}/worldcup.json")
         if not data:
             continue
@@ -67,7 +124,7 @@ def load_historical_matches():
                 continue
             t1 = HIST_MAP.get(m["team1"], m["team1"])
             t2 = HIST_MAP.get(m["team2"], m["team2"])
-            all_m.append({"team1": t1, "team2": t2, "g1": m["score"]["ft"][0], "g2": m["score"]["ft"][1]})
+            all_m.append({"team1": t1, "team2": t2, "g1": m["score"]["ft"][0], "g2": m["score"]["ft"][1], "w": weight})
     return all_m
 
 def build_model():
@@ -76,10 +133,13 @@ def build_model():
 
     stats = defaultdict(lambda: {"gf": 0, "ga": 0, "pj": 0})
     for m in hist_matches:
+        w = m["w"]
         for t, gf, ga in [(m["team1"], m["g1"], m["g2"]), (m["team2"], m["g2"], m["g1"])]:
-            stats[t]["gf"] += gf; stats[t]["ga"] += ga; stats[t]["pj"] += 1
+            stats[t]["gf"] += gf * w
+            stats[t]["ga"] += ga * w
+            stats[t]["pj"] += w
 
-    league_avg = sum(m["g1"]+m["g2"] for m in hist_matches) / len(hist_matches) / 2
+    league_avg = sum((m["g1"]+m["g2"]) * m["w"] for m in hist_matches) / sum(m["w"] for m in hist_matches) / 2 if hist_matches else 1
     print(f"  Promedio goles/partido: {league_avg*2:.2f}")
 
     all_teams = [t for c in conf_map.values() for t in c]
@@ -97,8 +157,7 @@ def build_model():
     for conf, cteams in conf_map.items():
         atk = [strengths[t]["attack"] for t in cteams if t in strengths]
         dfn = [strengths[t]["defense"] for t in cteams if t in strengths]
-        conf_avgs[conf] = {"attack": sum(atk)/len(atk) if atk else 1.0,
-                           "defense": sum(dfn)/len(dfn) if dfn else 1.0}
+        conf_avgs[conf] = {"attack": sum(atk)/len(atk) if atk else 1.0, "defense": sum(dfn)/len(dfn) if dfn else 1.0}
 
     team_conf = {t: c for c, ct in conf_map.items() for t in ct}
 
@@ -113,8 +172,10 @@ def build_model():
             s["defense_hist"] = s["defense"]
             s["estimated"] = False
         else:
-            atk = ca["attack"] * rf
-            defn = ca["defense"] / rf
+            rf_adj = rf ** 1.5
+            conf_w = 0.6
+            atk = (ca["attack"] * conf_w + 1.0 * (1 - conf_w)) * rf_adj
+            defn = (ca["defense"] * conf_w + 1.0 * (1 - conf_w)) / rf_adj
             strengths[team] = {
                 "attack": atk, "defense": defn,
                 "attack_hist": atk, "defense_hist": defn,
@@ -138,31 +199,36 @@ def update_form(team, obs_attack, obs_defense, strengths):
         s["defense_form"] = dfn
 
 def get_combined_strength(team, strengths):
-    s = strengths[team]
-    n_form = len(s["form_obs"])
-    if n_form >= 2:
-        w_hist = max(0.3, 0.7 - 0.05 * n_form)
-    else:
-        w_hist = 0.85
-    atk = w_hist * s["attack_hist"] + (1 - w_hist) * s["attack_form"]
-    dfn = w_hist * s["defense_hist"] + (1 - w_hist) * s["defense_form"]
+    s = strengths.get(team, {})
+    nf = len(s.get("form_obs", []))
+    w_hist = 0.85 if nf < 2 else max(0.3, 0.7 - 0.05 * nf)
+    atk = w_hist * s.get("attack_hist", 1.0) + (1-w_hist) * s.get("attack_form", 1.0)
+    dfn = w_hist * s.get("defense_hist", 1.0) + (1-w_hist) * s.get("defense_form", 1.0)
     return atk, dfn
 
-def predict(t1, t2, strengths, league_avg, is_knockout=False):
-    atk1, def1 = get_combined_strength(t1, strengths)
-    atk2, def2 = get_combined_strength(t2, strengths)
-    e1 = league_avg * atk1 * def2
-    e2 = league_avg * atk2 * def1
-    if is_knockout:
-        e1 *= 0.82
-        e2 *= 0.82
+def predict(t1, t2, strengths, league_avg, ronda=""):
+    a1, d1 = get_combined_strength(t1, strengths)
+    a2, d2 = get_combined_strength(t2, strengths)
+    e1 = league_avg * a1 * d2
+    e2 = league_avg * a2 * d1
+    if ronda:
+        f = 1.0
+        for key, val in KO_FACTOR.items():
+            if key in ronda:
+                f = val
+                break
+        else:
+            if "Matchday" not in ronda:
+                f = 0.82
+        e1 *= f
+        e2 *= f
     return e1, e2
 
 def poisson(l, k):
     if l <= 0: return 1.0 if k == 0 else 0.0
     return math.exp(-l) * (l**k) / math.factorial(k)
 
-def probs(e1, e2, mg=6):
+def probs(e1, e2, mg=6, market_odds=None):
     exact = {}
     for g1 in range(mg+1):
         for g2 in range(mg+1):
@@ -170,9 +236,19 @@ def probs(e1, e2, mg=6):
     w1 = sum(p for (g1,g2),p in exact.items() if g1>g2)
     dr = sum(p for (g1,g2),p in exact.items() if g1==g2)
     w2 = sum(p for (g1,g2),p in exact.items() if g1<g2)
-    ml = max(exact, key=exact.get)
+    if market_odds:
+        m_w1, m_dr, m_w2 = market_odds
+        tot = m_w1 + m_dr + m_w2
+        m_w1, m_dr, m_w2 = m_w1/tot, m_dr/tot, m_w2/tot
+        w1 = (1 - ODDS_WEIGHT) * w1 + ODDS_WEIGHT * m_w1
+        dr = (1 - ODDS_WEIGHT) * dr + ODDS_WEIGHT * m_dr
+        w2 = (1 - ODDS_WEIGHT) * w2 + ODDS_WEIGHT * m_w2
+    def ev(s):
+        p_out = w1 if s[0] > s[1] else (dr if s[0] == s[1] else w2)
+        return exact[s] + p_out
+    best = max(exact, key=ev)
     return {"w1": round(w1*100,1), "dr": round(dr*100,1), "w2": round(w2*100,1),
-            "ml": list(ml), "pml": round(exact[ml]*100,1)}
+            "ml": list(best), "pml": round(exact[best]*100,1)}
 
 def update_strengths(m, strengths, league_avg):
     t1, t2, g1, g2 = m["team1"], m["team2"], m["g1"], m["g2"]
@@ -222,7 +298,7 @@ def run_simulation():
         s = strengths[team]
         rf = RANKING_FACTOR.get(team, 1.0)
         src = "Estimado" if s.get("estimated",False) else "Real"
-        print(f"{es(team):25s} {s['attack']:>8.2f} {s['defense']:>8.2f} {s['pj_hist']:>4d} {rf:>5.2f} {src}")
+        print(f"{es(team):25s} {s['attack']:>8.2f} {s['defense']:>8.2f} {s['pj_hist']:>4.0f} {rf:>5.2f} {src}")
 
     matches = load_2026()
     if not matches:
@@ -233,16 +309,23 @@ def run_simulation():
     print("  SIMULACION SECUENCIAL CON MOMENTUM")
     print(f"{'='*60}\n")
 
+    market_odds = fetch_market_odds()
+
     log = []
     c_result, c_exact, total = 0, 0, 0
 
     for m in matches:
         t1, t2 = m["team1"], m["team2"]
-        is_ko = "Round" in m.get("group","") or "Quarter" in m.get("group","") or "Semi" in m.get("group","") or "Final" in m.get("group","") or not m.get("group","").startswith("Group")
-        knockout = not m.get("group","").startswith("Group") and m.get("group","") != ""
 
-        e1, e2 = predict(t1, t2, strengths, league_avg, knockout)
-        p = probs(e1, e2)
+        e1, e2 = predict(t1, t2, strengths, league_avg, m.get("group", ""))
+        mo = market_odds.get((norm_team(t1), norm_team(t2)))
+        has_odds = mo is not None
+        if not has_odds:
+            mo_rev = market_odds.get((norm_team(t2), norm_team(t1)))
+            if mo_rev:
+                mo = (mo_rev[2], mo_rev[1], mo_rev[0])
+                has_odds = True
+        p = probs(e1, e2, market_odds=mo)
         played = "score" in m
 
         if played:
@@ -259,7 +342,7 @@ def run_simulation():
             exact_m = " ✓" if e_ok else " "
             print(f"  {m['date']} | {m['group']}")
             print(f"  {marca} {es(t1):25s} {g1}-{g2:<3d} {es(t2)}{exact_m} 🔄")
-            print(f"    Pred: {p['ml'][0]}-{p['ml'][1]}  {es(t1)}:{p['w1']:.0f}% Emp:{p['dr']:.0f}% {es(t2)}:{p['w2']:.0f}%   (lr={min(0.12,1.0/(1.0+strengths[t1]['pj_hist'])):.3f})")
+            print(f"    Pred: {p['ml'][0]}-{p['ml'][1]}  {es(t1)}:{p['w1']:.0f}% Emp:{p['dr']:.0f}% {es(t2)}:{p['w2']:.0f}%   (lr={min(0.12,1.0/(1.0+strengths[t1]['pj_hist'])):.3f}){' 📊' if has_odds else ''}")
 
             update_strengths({"team1":t1,"team2":t2,"g1":g1,"g2":g2}, strengths, league_avg)
 
@@ -270,11 +353,12 @@ def run_simulation():
             print()
 
             log.append({"date":m["date"],"group":m["group"],"t1":t1,"t2":t2,
-                       "pred":list(p["ml"]),"real":[g1,g2],"r_ok":r_ok,"e_ok":e_ok})
+                       "pred":list(p["ml"]),"real":[g1,g2],"r_ok":r_ok,"e_ok":e_ok,
+                       "has_odds": has_odds})
         else:
             print(f"  {m['date']} | {m['group']}")
             print(f"     {es(t1):25s} vs {es(t2)}")
-            print(f"    Pred: {p['ml'][0]}-{p['ml'][1]}  {es(t1)}:{p['w1']:.0f}% Emp:{p['dr']:.0f}% {es(t2)}:{p['w2']:.0f}%")
+            print(f"    Pred: {p['ml'][0]}-{p['ml'][1]}  {es(t1)}:{p['w1']:.0f}% Emp:{p['dr']:.0f}% {es(t2)}:{p['w2']:.0f}%{' 📊' if has_odds else ' 📡'}")
             print()
 
     print("="*60)
@@ -292,7 +376,7 @@ def run_simulation():
         if nf > 0 and s["pj_hist"] > 3:
             if abs(s["attack_form"] - s["attack_hist"]) > 0.15:
                 marca = " ⚡"
-        print(f"{es(team):25s} {s['attack_hist']:>8.2f} {s['defense_hist']:>8.2f} {s['attack_form']:>8.2f} {s['defense_form']:>8.2f} {s['pj']:>4d}{marca}")
+        print(f"{es(team):25s} {s['attack_hist']:>8.2f} {s['defense_hist']:>8.2f} {s['attack_form']:>8.2f} {s['defense_form']:>8.2f} {s['pj']:>4.0f}{marca}")
 
 if __name__ == "__main__":
     run_simulation()

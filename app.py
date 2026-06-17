@@ -230,7 +230,7 @@ def fetch_and_update():
             if r_ok: state["correct_result"] += 1
             if e_ok: state["correct_exact"] += 1
             state["total_played"] += 1
-            update_strengths({"team1": t1, "team2": t2, "g1": g1, "g2": g2}, state["strengths"], state["league_avg"])
+            state["league_avg"] = update_strengths({"team1": t1, "team2": t2, "g1": g1, "g2": g2}, state["strengths"], state["league_avg"])
 
             lk = f"{m['date']}|{t1}|{t2}"
             for entry in state["log"]:
